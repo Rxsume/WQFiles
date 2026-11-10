@@ -71,7 +71,7 @@ static BOOL wq_ls_signature_equal(NSDictionary *a, NSDictionary *b)
 
 static NSString *wq_ls_error(NSString *path, NSString *reason)
 {
-    return [NSString stringWithFormat:@"%@ (%@)", path ?: @"<none>", reason ?: @"unknown error"];
+    return [NSString stringWithFormat:@"%@ (%@)", path ?: @"<none>", reason ?: @"未知错误"];
 }
 
 static BOOL wq_ls_candidate_info(NSString *path, struct stat *st)
@@ -448,7 +448,7 @@ static BOOL wq_parse_ls_store(NSData *data, NSDictionary **displayOut,
         anyPlugins += layoutPlugins[l].length / (2 * sizeof(uint32_t));
     }
     if (!anyRecords) {
-        wq_ls_log_summary(b, n, @"none", 0, anyPlugins, 0, 0);
+        wq_ls_log_summary(b, n, @"无", 0, anyPlugins, 0, 0);
         wq_log(@"names: LaunchServices store contains no bundle records");
         return NO;
     }

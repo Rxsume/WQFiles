@@ -1,3 +1,7 @@
+# WQ Files 汉化版
+
+> 简体中文汉化版，基于上游 kolbicz/WQFiles v0.7（commit 78a41d0）。界面 460 条字符串已译为简体中文；功能、Bundle ID、签名方式与上游一致。推送到 main 后由 `.github/workflows/build-zh-ipa.yml` 在 macOS runner 上跑上游测试套件并编译出无签名 IPA，发布到 Release `v0.7-zh-CN`。
+
 # Worse Query Files
 
 **WQ Files** is a file browser, app data manager and cache cleaner for iOS 26

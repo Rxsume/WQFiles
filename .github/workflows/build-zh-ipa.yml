@@ -1,0 +1,34 @@
+name: Build Chinese IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build unsigned IPA (runs upstream test suite first)
+        run: ./build.sh
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WQFiles-zh-0.7
+          path: WQFiles.ipa
+          if-no-files-found: error
+      - name: Publish release v0.7-zh-CN
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v0.7-zh-CN >/dev/null 2>&1; then
+            gh release upload v0.7-zh-CN --clobber WQFiles.ipa
+          else
+            gh release create v0.7-zh-CN WQFiles.ipa \
+              --title "WQ Files 0.7 汉化版" \
+              --notes "WQ Files v0.7 简体中文汉化版（基于 kolbicz/WQFiles 0.7，界面 460 条字符串已译为简体中文）。无签名 IPA，需用 AltStore / SideStore 等自签安装，最低 iOS 26.0。"
+          fi
