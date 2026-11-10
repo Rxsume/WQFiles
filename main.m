@@ -23,6 +23,7 @@
 #import "WQPlistEditor.h"
 #import "WQPlistEditorSupport.h"
 #import "WQHexViewer.h"
+#import "WQSQLiteViewer.h"
 
 static BOOL wq_looks_like_uuid(NSString *name)
 {
@@ -52,6 +53,7 @@ static BOOL wq_regular_file_for_ui(NSString *path)
 @property (nonatomic) mode_t mode;
 @property (nonatomic) uid_t uid;
 @property (nonatomic, strong) NSDate *modified;
+@property (nonatomic, strong) NSDate *created;
 @end
 
 @implementation WQItem
@@ -59,7 +61,7 @@ static BOOL wq_regular_file_for_ui(NSString *path)
 
 #pragma mark - File viewer
 
-typedef NS_ENUM(NSInteger, WQOpenMode) { WQOpenAuto, WQOpenPlist, WQOpenText, WQOpenHex };
+typedef NS_ENUM(NSInteger, WQOpenMode) { WQOpenAuto, WQOpenPlist, WQOpenText, WQOpenHex, WQOpenSQLite };
 // Opens a file in the fitting viewer (Auto: chosen from its first bytes).
 static void wq_open_file(UINavigationController *nav, NSString *path, BOOL readOnly, WQOpenMode mode);
 
@@ -170,6 +172,8 @@ static NSString *wq_file_hex_dump(NSData *data, BOOL truncated)
                           handler:^(UIAction *__unused a) { [weakSelf reopenAs:WQOpenPlist]; }],
         [UIAction actionWithTitle:@"十六进制查看器" image:[UIImage systemImageNamed:@"number"] identifier:nil
                           handler:^(UIAction *__unused a) { [weakSelf reopenAs:WQOpenHex]; }],
+        [UIAction actionWithTitle:@"SQLite 查看器" image:[UIImage systemImageNamed:@"tablecells"] identifier:nil
+                          handler:^(UIAction *__unused a) { [weakSelf reopenAs:WQOpenSQLite]; }],
     ]];
     UIBarButtonItem *more = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"] menu:openAs];
     self.navigationItem.rightBarButtonItems = @[share, more];
@@ -419,6 +423,7 @@ static WQOpenMode wq_sniff(NSData *head)
     const uint8_t *b = head.bytes;
     NSUInteger n = head.length;
     if (n >= 7 && memcmp(b, "bplist0", 7) == 0) return WQOpenPlist;
+    if (wq_is_sqlite_header(head)) return WQOpenSQLite;
     if ((n >= 8 && memcmp(b, "\x89PNG", 4) == 0) || (n >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) ||
         (n >= 4 && memcmp(b, "GIF8", 4) == 0) || (n >= 12 && memcmp(b + 4, "ftyp", 4) == 0))
         return WQOpenText;   // images: the file viewer renders them
@@ -453,6 +458,8 @@ static void wq_open_file(UINavigationController *nav, NSString *path, BOOL readO
             vc = editor;
         } else if (m == WQOpenHex) {
             vc = [[WQHexViewController alloc] initWithPath:path readOnly:readOnly];
+        } else if (m == WQOpenSQLite) {
+            vc = [[WQSQLiteViewController alloc] initWithPath:path];
         } else {
             WQFileViewController *file = [[WQFileViewController alloc] initWithPath:path];
             file.readOnly = readOnly;
@@ -492,6 +499,80 @@ static NSString *wq_folder_date_text(NSDate *date)
     return date ? [formatter stringFromDate:date] : @"";
 }
 
+#pragma mark - Folder sorting
+
+// One sort order for all folders, remembered. Each key starts in its natural
+// direction (A–Z, newest first, largest first); picking it again reverses it.
+typedef NS_ENUM(NSInteger, WQSortKey) { WQSortName, WQSortModified, WQSortCreated, WQSortSize };
+static NSString *const kWQSortKeyPref = @"WQFolderSortKey";
+static NSString *const kWQSortAscendingPref = @"WQFolderSortAscending";
+static NSString *const kWQFoldersFirstPref = @"WQFolderSortFoldersFirst";
+
+static WQSortKey wq_sort_key(void)
+{
+    NSInteger key = [NSUserDefaults.standardUserDefaults integerForKey:kWQSortKeyPref];
+    return key >= WQSortName && key <= WQSortSize ? (WQSortKey)key : WQSortName;
+}
+
+static BOOL wq_sort_ascending(void)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:kWQSortAscendingPref];
+    return value ? [value boolValue] : YES;
+}
+
+static BOOL wq_folders_first(void)
+{
+    id value = [NSUserDefaults.standardUserDefaults objectForKey:kWQFoldersFirstPref];
+    return value ? [value boolValue] : YES;
+}
+
+static void wq_choose_sort(WQSortKey key)
+{
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    BOOL ascending = key == wq_sort_key() ? !wq_sort_ascending() : key == WQSortName;
+    [d setInteger:key forKey:kWQSortKeyPref];
+    [d setBool:ascending forKey:kWQSortAscendingPref];
+}
+
+static NSString *wq_sort_direction_text(WQSortKey key, BOOL ascending)
+{
+    switch (key) {
+        case WQSortName: return ascending ? @"A–Z" : @"Z–A";
+        case WQSortSize: return ascending ? @"从小到大" : @"从大到小";
+        default: return ascending ? @"从旧到新" : @"从新到旧";
+    }
+}
+
+static NSArray<WQItem *> *wq_sorted_items(NSArray<WQItem *> *items)
+{
+    WQSortKey key = wq_sort_key();
+    BOOL ascending = wq_sort_ascending(), foldersFirst = wq_folders_first();
+    return [items sortedArrayUsingComparator:^NSComparisonResult(WQItem *a, WQItem *b) {
+        if (foldersFirst && a.isDir != b.isDir) return a.isDir ? NSOrderedAscending : NSOrderedDescending;
+        NSComparisonResult r = NSOrderedSame;
+        switch (key) {
+            case WQSortName: break;
+            case WQSortModified: r = [(a.modified ?: NSDate.distantPast) compare:(b.modified ?: NSDate.distantPast)]; break;
+            case WQSortCreated: r = [(a.created ?: NSDate.distantPast) compare:(b.created ?: NSDate.distantPast)]; break;
+            case WQSortSize: r = a.size < b.size ? NSOrderedAscending : a.size > b.size ? NSOrderedDescending : NSOrderedSame; break;
+        }
+        NSComparisonResult byName = [(a.label ?: a.name ?: @"") localizedStandardCompare:(b.label ?: b.name ?: @"")];
+        if (key == WQSortName) r = byName;
+        if (r == NSOrderedSame) return byName;
+        return ascending ? r : (NSComparisonResult)-r;
+    }];
+}
+
+// Sidebar letter for an entry: its first letter without accents, "#" for the rest.
+static NSString *wq_index_letter(NSString *name)
+{
+    if (!name.length) return @"#";
+    NSString *first = [[name substringWithRange:[name rangeOfComposedCharacterSequenceAtIndex:0]]
+                       stringByFoldingWithOptions:NSDiacriticInsensitiveSearch | NSCaseInsensitiveSearch locale:nil].uppercaseString;
+    unichar c = first.length ? [first characterAtIndex:0] : 0;
+    return (c >= 'A' && c <= 'Z') ? [NSString stringWithCharacters:&c length:1] : @"#";
+}
+
 @implementation WQDirViewController {
     NSString *_path;
     NSArray<WQItem *> *_all;     // everything in the folder
@@ -518,6 +599,8 @@ static NSString *wq_folder_date_text(NSDate *date)
     BOOL _scanInFlight;
     BOOL _scanNeedsRefresh;
     NSTimeInterval _lastReloadFinished;
+    NSArray<NSString *> *_indexTitles;          // sidebar letters, when sorted by name
+    NSDictionary<NSString *, NSNumber *> *_indexRows;   // letter -> first row
 }
 
 - (instancetype)initWithPath:(NSString *)path title:(NSString *)title
@@ -556,6 +639,34 @@ static NSString *wq_folder_date_text(NSDate *date)
     }
     [menuItems addObject:[UIAction actionWithTitle:@"复制路径" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil
                           handler:^(UIAction *__unused a) { UIPasteboard.generalPasteboard.string = path; }]];
+    // Built when the menu opens, so the checkmarks show the current order.
+    [menuItems addObject:[UIDeferredMenuElement elementWithUncachedProvider:^(void (^completion)(NSArray<UIMenuElement *> *)) {
+        WQSortKey current = wq_sort_key();
+        BOOL ascending = wq_sort_ascending();
+        NSMutableArray *sortActions = [NSMutableArray new];
+        NSArray *titles = @[@"名称", @"修改日期", @"创建日期", @"大小"];
+        for (NSInteger key = WQSortName; key <= WQSortSize; key++) {
+            UIAction *action = [UIAction actionWithTitle:titles[(NSUInteger)key] image:nil identifier:nil handler:^(UIAction *__unused a) {
+                wq_choose_sort((WQSortKey)key);
+                [weakSelf resortAfterChange];
+            }];
+            if (key == current) {
+                action.state = UIMenuElementStateOn;
+                action.subtitle = wq_sort_direction_text((WQSortKey)key, ascending);
+            }
+            [sortActions addObject:action];
+        }
+        UIAction *folders = [UIAction actionWithTitle:@"文件夹置顶" image:nil identifier:nil handler:^(UIAction *__unused a) {
+            [NSUserDefaults.standardUserDefaults setBool:!wq_folders_first() forKey:kWQFoldersFirstPref];
+            [weakSelf resortAfterChange];
+        }];
+        folders.state = wq_folders_first() ? UIMenuElementStateOn : UIMenuElementStateOff;
+        UIMenu *order = [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[folders]];
+        UIMenu *sort = [UIMenu menuWithTitle:@"排序方式" image:[UIImage systemImageNamed:@"arrow.up.arrow.down"] identifier:nil options:0
+                                    children:[sortActions arrayByAddingObject:order]];
+        sort.subtitle = [NSString stringWithFormat:@"%@, %@", titles[(NSUInteger)current], wq_sort_direction_text(current, ascending)];
+        completion(@[sort]);
+    }]];
     _menuItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"]
                                                  menu:[UIMenu menuWithChildren:menuItems]];
     if (_backupStorage) {
@@ -666,14 +777,49 @@ static NSString *wq_folder_date_text(NSDate *date)
 // App name, bundle or group ID, or file name; case and accents ignored.
 - (void)applyFilter
 {
-    if (!_query) { _items = _all; return; }
-    NSStringCompareOptions opts = NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch;
-    NSString *q = _query;
-    _items = [_all filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(WQItem *item, NSDictionary *__unused b) {
-        for (NSString *field in @[item.label ?: @"", item.name ?: @"", item.bundleID ?: @""])
-            if ([field rangeOfString:q options:opts].location != NSNotFound) return YES;
-        return NO;
-    }]];
+    NSArray<WQItem *> *shown = _all ?: @[];
+    if (_query) {
+        NSStringCompareOptions opts = NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch;
+        NSString *q = _query;
+        shown = [shown filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(WQItem *item, NSDictionary *__unused b) {
+            for (NSString *field in @[item.label ?: @"", item.name ?: @"", item.bundleID ?: @""])
+                if ([field rangeOfString:q options:opts].location != NSNotFound) return YES;
+            return NO;
+        }]];
+    }
+    _items = wq_sorted_items(shown);
+    // Alphabet sidebar: only for longer lists sorted by name.
+    NSMutableArray *titles = [NSMutableArray new];
+    NSMutableDictionary *rows = [NSMutableDictionary new];
+    if (wq_sort_key() == WQSortName && _items.count >= 25) {
+        [_items enumerateObjectsUsingBlock:^(WQItem *item, NSUInteger row, BOOL *__unused stop) {
+            NSString *letter = wq_index_letter(item.label ?: item.name);
+            if (!rows[letter]) { rows[letter] = @(row); [titles addObject:letter]; }
+        }];
+    }
+    _indexTitles = titles.count > 1 ? titles : nil;
+    _indexRows = rows;
+}
+
+- (NSArray<NSString *> *)sectionIndexTitlesForTableView:(UITableView *)tableView
+{
+    return _selectingBackups || _error ? nil : _indexTitles;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView sectionForSectionIndexTitle:(NSString *)title atIndex:(NSInteger)index
+{
+    NSNumber *row = _indexRows[title];
+    if (row && row.unsignedIntegerValue < _items.count)
+        [tableView scrollToRowAtIndexPath:[NSIndexPath indexPathForRow:row.integerValue inSection:0]
+                         atScrollPosition:UITableViewScrollPositionTop animated:NO];
+    return -1;   // already scrolled to the row; the list has one section
+}
+
+- (void)resortAfterChange
+{
+    [self applyFilter];
+    [self.tableView reloadData];
+    [self.tableView reloadSectionIndexTitles];
 }
 
 #pragma mark Backup multi-selection
@@ -910,6 +1056,7 @@ static NSString *wq_folder_date_text(NSDate *date)
                 item.mode = st.st_mode;
                 item.uid = st.st_uid;
                 item.modified = [NSDate dateWithTimeIntervalSince1970:st.st_mtimespec.tv_sec];
+                item.created = [NSDate dateWithTimeIntervalSince1970:st.st_birthtimespec.tv_sec];
             }
             if (!haveFullPaths && labels && item.isDir && wq_looks_like_uuid(name)) {
                 NSString *bid = wq_container_label(item.path);
@@ -937,10 +1084,6 @@ static NSString *wq_folder_date_text(NSDate *date)
             }
             [items addObject:item];
         }
-        [items sortUsingComparator:^NSComparisonResult(WQItem *a, WQItem *b) {
-            if (a.isDir != b.isDir) return a.isDir ? NSOrderedAscending : NSOrderedDescending;
-            return [(a.label ?: a.name) localizedCaseInsensitiveCompare:(b.label ?: b.name)];
-        }];
         dispatch_async(dispatch_get_main_queue(), ^{
             if (generation != self->_scanGeneration) return;
             self->_scanInFlight = NO;
@@ -954,7 +1097,9 @@ static NSString *wq_folder_date_text(NSDate *date)
             self->_all = items;
             [self applyFilter];
             self->_error = (names || childPaths != nil) ? nil
-                : (error.length ? error : @"无法列出此文件夹。容器枚举失败；见“日志”。");
+                : (error.length ? error
+                   : wq_full_scan_was_declined() ? @"尚未列出：需要扫描全部文件。下拉即可开始。"
+                   : @"无法列出此文件夹。容器枚举失败；见“日志”。");
             self->_scanStatus = nil;
             self->_lastReloadFinished = NSDate.date.timeIntervalSinceReferenceDate;
             [self.refreshControl endRefreshing];
@@ -989,7 +1134,9 @@ static NSString *wq_folder_date_text(NSDate *date)
     }
     WQItem *item = _items[(NSUInteger)indexPath.row];
     c.text = item.label ?: item.name;
-    NSString *date = wq_folder_date_text(item.modified);
+    BOOL byCreated = wq_sort_key() == WQSortCreated;
+    NSString *date = wq_folder_date_text(byCreated ? item.created : item.modified);
+    if (byCreated) date = [@"创建于 " stringByAppendingString:date];
     NSString *detail = item.isDir ? date : [NSString stringWithFormat:@"%@ · %@", wq_size_text(item.size), date];
     if (item.label) detail = [NSString stringWithFormat:@"%@\n%@", item.name, detail];
     if (item.isLink) detail = [@"符号链接 · " stringByAppendingString:detail];
@@ -1166,6 +1313,8 @@ static NSString *wq_folder_date_text(NSDate *date)
                                   handler:^(UIAction *__unused a) { WQDirViewController *strongSelf = weakSelf; WQItem *latest = currentItem(); if (strongSelf && latest) wq_open_file(strongSelf.navigationController, latest.path, ro, WQOpenText); }],
                 [UIAction actionWithTitle:@"十六进制查看器" image:[UIImage systemImageNamed:@"number"] identifier:nil
                                   handler:^(UIAction *__unused a) { WQDirViewController *strongSelf = weakSelf; WQItem *latest = currentItem(); if (strongSelf && latest) wq_open_file(strongSelf.navigationController, latest.path, ro, WQOpenHex); }],
+                [UIAction actionWithTitle:@"SQLite 查看器" image:[UIImage systemImageNamed:@"tablecells"] identifier:nil
+                                  handler:^(UIAction *__unused a) { WQDirViewController *strongSelf = weakSelf; WQItem *latest = currentItem(); if (strongSelf && latest) wq_open_file(strongSelf.navigationController, latest.path, ro, WQOpenSQLite); }],
             ]]];
         }
         [actions addObject:[UIAction actionWithTitle:@"复制路径" image:[UIImage systemImageNamed:@"doc.on.doc"]
@@ -1590,13 +1739,32 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
                 wq_alert(self, @"中断的恢复已恢复", recovery);
             });
         }
+        (void)wq_app_group();   // resolves (and logs) the group off the main thread
+    });
+}
+
+// Signing check, once the start screen is on screen (an alert presented
+// while it is still loading would be dropped).
+- (void)viewDidAppear:(BOOL)animated
+{
+    [super viewDidAppear:animated];
+    static BOOL checked;
+    if (checked) return;
+    checked = YES;
+    dispatch_async(wq_io(), ^{
         NSString *group = wq_app_group();
-        if (!group) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                wq_alert(self, @"无应用分组",
-                         @"此应用需要 App Group 才能访问其他文件夹。请使用保留 App Group 权限的工具重新签名。");
-            });
-        }
+        if (group) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"签名问题：缺少 App Group"
+                message:@"WQ Files 需要 App Group 才能访问其他应用的文件夹，但签名工具把它移除了。没有它，什么都打不开，应用列表会保持空白或显示“NO TOKEN”。\n\n请使用 AltStore、SideStore 或 Sideloadly 重新安装 WQ Files（它们会创建 App Group），或使用包含 App Group 的描述文件进行签名。通配符证书（如许多 Feather/ESign 配置所用的）无法做到这一点。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"签名帮助" style:UIAlertActionStyleDefault handler:^(UIAlertAction *__unused a) {
+                [UIApplication.sharedApplication openURL:[NSURL URLWithString:@"https://github.com/kolbicz/WQFiles#signing-the-app-group"]
+                                                 options:@{} completionHandler:nil];
+            }]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+        });
     });
 }
 
@@ -1605,7 +1773,9 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
 {
     UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 128)];
     UILabel *by = [UILabel new];
-    by.text = @"WQ Files 作者：kolbicz";
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    by.text = [NSString stringWithFormat:@"WQ Files %@（%@）作者：kolbicz",
+               info[@"CFBundleShortVersionString"] ?: @"?", info[@"CFBundleVersion"] ?: @"?"];
     by.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     by.textColor = UIColor.secondaryLabelColor;
 
@@ -1781,6 +1951,183 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
 
 @end
 
+#pragma mark - Full scan: confirmation and progress window
+
+static UIViewController *wq_top_view_controller(void)
+{
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class] || scene.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (!window.isKeyWindow) continue;
+            UIViewController *top = window.rootViewController;
+            while (top.presentedViewController && !top.presentedViewController.isBeingDismissed) top = top.presentedViewController;
+            return top;
+        }
+    }
+    return nil;
+}
+
+static NSString *wq_duration_text(double seconds)
+{
+    if (seconds < 90) return @"约一分钟";
+    if (seconds < 3600) return [NSString stringWithFormat:@"约 %.0f 分钟", ceil(seconds / 60)];
+    return [NSString stringWithFormat:@"约 %.1f 小时", seconds / 3600];
+}
+
+static NSString *wq_count_text(int64_t n)
+{
+    if (n >= 1000000) return [NSString stringWithFormat:@"%.0f百万", n / 1e6];
+    return [NSNumberFormatter localizedStringFromNumber:@(n) numberStyle:NSNumberFormatterDecimalStyle];
+}
+
+@interface WQScanWindowController : UIViewController
+- (void)updateDone:(int64_t)done total:(int64_t)total;
+@end
+
+@implementation WQScanWindowController {
+    UIProgressView *_bar;
+    UILabel *_status;
+    CFAbsoluteTime _started;
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    _started = CFAbsoluteTimeGetCurrent();
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"magnifyingglass"]];
+    icon.preferredSymbolConfiguration = [UIImageSymbolConfiguration configurationWithPointSize:40 weight:UIImageSymbolWeightRegular];
+    icon.tintColor = UIColor.tintColor;
+    UILabel *title = [UILabel new];
+    title.text = @"正在扫描全部文件";
+    title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
+    title.adjustsFontForContentSizeCategory = YES;
+    UILabel *text = [UILabel new];
+    text.numberOfLines = 0;
+    text.textAlignment = NSTextAlignmentCenter;
+    text.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    text.textColor = UIColor.secondaryLabelColor;
+    text.text = @"iOS 不允许 WQ Files 直接列出这些文件夹，因此它会检查此设备上的每个文件一次。首次会比较慢，之后的扫描只检查新增文件。\n\n请保持 WQ Files 打开。切换到其他应用或锁定屏幕会暂停扫描。";
+    _bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    _status = [UILabel new];
+    _status.font = [UIFont monospacedDigitSystemFontOfSize:[UIFont preferredFontForTextStyle:UIFontTextStyleBody].pointSize
+                                                    weight:UIFontWeightRegular];
+    _status.textAlignment = NSTextAlignmentCenter;
+    _status.text = @"正在开始…";
+    UIButton *hide = [UIButton buttonWithConfiguration:UIButtonConfiguration.borderedButtonConfiguration primaryAction:
+        [UIAction actionWithTitle:@"隐藏" image:nil identifier:nil handler:^(UIAction *__unused a) {
+            [self dismissViewControllerAnimated:YES completion:nil];
+        }]];
+    UIButtonConfiguration *stopConfig = UIButtonConfiguration.borderedButtonConfiguration;
+    stopConfig.baseForegroundColor = UIColor.systemRedColor;
+    UIButton *stop = [UIButton buttonWithConfiguration:stopConfig primaryAction:
+        [UIAction actionWithTitle:@"停止扫描" image:nil identifier:nil handler:^(UIAction *__unused a) {
+            wq_full_scan_stop();
+            [self dismissViewControllerAnimated:YES completion:nil];
+        }]];
+    UIStackView *buttons = [[UIStackView alloc] initWithArrangedSubviews:@[hide, stop]];
+    buttons.spacing = 12;
+    buttons.distribution = UIStackViewDistributionFillEqually;
+    UILabel *note = [UILabel new];
+    note.numberOfLines = 0;
+    note.textAlignment = NSTextAlignmentCenter;
+    note.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    note.textColor = UIColor.tertiaryLabelColor;
+    note.text = @"隐藏后扫描会继续进行，完成后列表会自动填入。";
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[icon, title, text, _bar, _status, buttons, note]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.alignment = UIStackViewAlignmentCenter;
+    stack.spacing = 16;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:stack];
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:24],
+        [stack.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-24],
+        [_bar.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+        [buttons.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+        [text.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+        [note.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+    ]];
+}
+
+- (void)updateDone:(int64_t)done total:(int64_t)total
+{
+    if (total <= 0) return;
+    float fraction = (float)((double)done / (double)total);
+    [_bar setProgress:fraction animated:NO];
+    double elapsed = CFAbsoluteTimeGetCurrent() - _started;
+    NSString *left = @"";
+    if (elapsed > 5 && done > 0 && done < total) {
+        double remaining = elapsed * (double)(total - done) / (double)done;
+        left = [@" · " stringByAppendingString:[wq_duration_text(remaining) stringByAppendingString:@"剩余"]];
+    }
+    _status.text = [NSString stringWithFormat:@"%.0f%%%@", fraction * 100, left];
+}
+
+@end
+
+static WQScanWindowController *gScanWindow;
+static UIBackgroundTaskIdentifier gScanBackgroundTask;   // 0 is UIBackgroundTaskInvalid
+
+// Called on a scan thread: asks on the main thread and waits for the answer.
+static BOOL wq_confirm_full_scan(NSString *what, int64_t ids, double seconds)
+{
+    dispatch_semaphore_t answered = dispatch_semaphore_create(0);
+    __block BOOL start = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *top = wq_top_view_controller();
+        if (!top) { dispatch_semaphore_signal(answered); return; }   // not in front: don't scan unasked
+        NSString *message = [NSString stringWithFormat:
+            @"要列出 %@，WQ Files 需要检查此设备上的每个文件一次：%@ 个文件，%@。\n\n这只在首次需要；之后的扫描只检查新增文件，只需几秒。\n\n扫描期间请保持 WQ Files 打开。", what, wq_count_text(ids), wq_duration_text(seconds)];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"扫描全部文件？" message:message
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"暂不" style:UIAlertActionStyleCancel handler:^(UIAlertAction *__unused a) {
+            dispatch_semaphore_signal(answered);
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"开始扫描" style:UIAlertActionStyleDefault handler:^(UIAlertAction *__unused a) {
+            start = YES;
+            // A little extra time when the user switches away (iOS grants about 30 s).
+            if (gScanBackgroundTask == UIBackgroundTaskInvalid) {
+                gScanBackgroundTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"WQ full scan" expirationHandler:^{
+                    [UIApplication.sharedApplication endBackgroundTask:gScanBackgroundTask];
+                    gScanBackgroundTask = UIBackgroundTaskInvalid;
+                }];
+            }
+            WQScanWindowController *window = [WQScanWindowController new];
+            window.modalPresentationStyle = UIModalPresentationPageSheet;
+            window.sheetPresentationController.detents = @[UISheetPresentationControllerDetent.mediumDetent,
+                                                          UISheetPresentationControllerDetent.largeDetent];
+            window.sheetPresentationController.prefersGrabberVisible = YES;
+            gScanWindow = window;
+            dispatch_semaphore_signal(answered);
+            // After the alert has gone (presenting during its dismissal fails).
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UIViewController *host = wq_top_view_controller();
+                if (gScanWindow == window && host && host != window) [host presentViewController:window animated:YES completion:nil];
+            });
+        }]];
+        [top presentViewController:alert animated:YES completion:nil];
+    });
+    dispatch_semaphore_wait(answered, DISPATCH_TIME_FOREVER);
+    return start;
+}
+
+static void wq_full_scan_progress(int64_t done, int64_t total, BOOL finished)
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!finished) { [gScanWindow updateDone:done total:total]; return; }
+        WQScanWindowController *window = gScanWindow;
+        gScanWindow = nil;
+        if (window.presentingViewController && !window.isBeingDismissed) [window dismissViewControllerAnimated:YES completion:nil];
+        if (gScanBackgroundTask != UIBackgroundTaskInvalid) {
+            [UIApplication.sharedApplication endBackgroundTask:gScanBackgroundTask];
+            gScanBackgroundTask = UIBackgroundTaskInvalid;
+        }
+    });
+}
+
 @interface WQAppDelegate : UIResponder <UIApplicationDelegate>
 @end
 
@@ -1804,6 +2151,7 @@ int main(int argc, char *argv[])
         // when the identifier attribute can't be read (iOS 27.2).
         wq_set_container_label_resolver(wq_bundle_id_for_container);
         wq_set_container_list_provider(wq_ls_container_paths);
+        wq_set_full_scan_ui(wq_confirm_full_scan, wq_full_scan_progress);
         return UIApplicationMain(argc, argv, nil, NSStringFromClass(WQAppDelegate.class));
     }
 }

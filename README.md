@@ -1,6 +1,6 @@
 # WQ Files 汉化版
 
-> 简体中文汉化版，基于上游 kolbicz/WQFiles v0.7（commit 78a41d0）。界面 460 条字符串已译为简体中文；功能、Bundle ID、签名方式与上游一致。推送到 main 后由 `.github/workflows/build-zh-ipa.yml` 在 macOS runner 上跑上游测试套件并编译出无签名 IPA，发布到 Release `v0.7-zh-CN`。
+> 简体中文汉化版，基于上游 kolbicz/WQFiles v0.8（commit 3f47953）。界面 526 条字符串已译为简体中文；功能、Bundle ID、签名方式与上游一致。推送到 main 后由 `.github/workflows/build-zh-ipa.yml` 在 macOS runner 上跑上游测试套件并编译出无签名 IPA，发布到 Release `v0.8-zh-CN`。
 
 # Worse Query Files
 
@@ -9,14 +9,16 @@ and 27. "WQ" stands for worse_query, the sandbox technique it is built on. It
 reaches other apps' and system containers with no jailbreak and no kernel
 exploit. Tested on iOS 26.7.1, 27.0.1 and 27.2.
 
-**iOS 26 (26.0 to 26.7.2):** supported since 0.7; tested on 26.7.1. worse_query reaches the app, extension, daemon and app group
+**iOS 26 (26.0 to 26.7.2):** preliminary support since 0.7; tested on 26.7.1. worse_query reaches the app, extension, daemon and app group
 containers there, but not System Data or the system groups, so WQ Files hides
 those two and the Cache Cleaner has no crash-log section. A full inode scan
 would take most of an hour on iOS 26, so App Data, Extension Data and App
 Groups are listed from the LaunchServices database instead (found once and
 remembered). Internal Daemons aren't in that database: the first scan for them
 takes long, later ones only check new files. Apps, backups, restores, clearing
-app data, the Cache Cleaner and the file browser work as on iOS 27.
+app data, the Cache Cleaner and the file browser work as on iOS 27. App icons
+don't: iOS 26 hands WQ Files only placeholder icons and doesn't let it read
+other apps' bundles, so apps show symbol tiles.
 
 ## What it opens
 
@@ -31,9 +33,14 @@ app data, the Cache Cleaner and the file browser work as on iOS 27.
   MobileGestalt cache and the configuration-profiles (Supervision) folder.
 - **Go to Path** for any absolute path.
 
-The container parents give no access token on 27.0.1, so their contents are
-found by asking the kernel for the path of each inode number (`fsgetpath`),
-the way KAMUI does it.
+The container parents can't be listed, so App Data, Extension Data and App
+Groups come from the LaunchServices database, which lists every installed
+app's and extension's containers. It is found once (among the newest files,
+usually within seconds) and remembered. Internal Daemons, and the app folders
+when the database can't be read, need a scan of every file id (`fsgetpath`,
+the way KAMUI does it): minutes on a well-used device the first time, so WQ
+Files asks before it starts and shows a scan window; later scans only check
+new files.
 
 ## Tools
 
@@ -49,13 +56,18 @@ the way KAMUI does it.
   and **Open As** switches between them. Saving writes back in place (same
   inode, owner and attributes). Create folders, import files, rename and
   delete (long-press, or swipe a row left or right; deleting always asks
-  first). Long-press a folder to share it as a ZIP.
+  first). Sort by name, date modified, date created or size from the •••
+  menu; long lists sorted by name get an A–Z sidebar. Long-press a folder to share it as a ZIP.
   - **Plist editor**: browse dictionaries and arrays, edit values by type
     (switches for booleans, numbers, text, dates, data as hex), add, delete,
     rename and reorder. Saves in the file's own format (binary or XML).
   - **Hex viewer and editor**: any file size (read in pages), go to offset,
     find hex bytes or text, overwrite bytes in place. Changed bytes are
     highlighted until saved; the file size never changes.
+  - **SQLite viewer** (read-only): tables and views with row counts, rows,
+    single rows in full, read-only SQL queries and CSV export. It works on a
+    copy of the database and its `-wal` file, so the app's own files are never
+    changed; close the app first for an up-to-date copy.
   - **Text and images**: text is editable, images render, plists can also be
     edited as XML text.
 - **Log**: file writes, backups, deletions, restores and errors the app handled, plus the App Group it received.
