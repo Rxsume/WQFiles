@@ -344,7 +344,7 @@ NSString *wq_backup_root(void)
     if (wq_test_backup_root) return wq_test_backup_root;
 #endif
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    return [docs stringByAppendingPathComponent:@"备份"];
+    return [docs stringByAppendingPathComponent:@"Backups"];
 }
 
 NSString *wq_app_backup_root(void)
