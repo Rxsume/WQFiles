@@ -18,17 +18,17 @@ jobs:
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WQFiles-zh-0.8
+          name: WQFiles-zh-0.8-b36
           path: WQFiles.ipa
           if-no-files-found: error
-      - name: Publish release v0.8-zh-CN
+      - name: Publish release v0.8-b36-zh-CN
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view v0.8-zh-CN >/dev/null 2>&1; then
-            gh release upload v0.8-zh-CN --clobber WQFiles.ipa
+          if gh release view v0.8-b36-zh-CN >/dev/null 2>&1; then
+            gh release upload v0.8-b36-zh-CN --clobber WQFiles.ipa
           else
-            gh release create v0.8-zh-CN WQFiles.ipa \
-              --title "WQ Files 0.8 汉化版" \
-              --notes "WQ Files v0.8 简体中文汉化版（基于 kolbicz/WQFiles 0.8，界面 526 条字符串已译为简体中文）。无签名 IPA，需用 AltStore / SideStore 等自签安装，最低 iOS 26.0。"
+            gh release create v0.8-b36-zh-CN WQFiles.ipa \
+              --title "WQ Files 0.8-b36 汉化版" \
+              --notes "WQ Files v0.8-b36 简体中文汉化版（基于 kolbicz/WQFiles 0.8-b36 测试版，界面 612 条字符串已译为简体中文）。无签名 IPA，需用 AltStore / SideStore 等自签安装，最低 iOS 26.0。"
           fi

@@ -1,6 +1,6 @@
 # WQ Files 汉化版
 
-> 简体中文汉化版，基于上游 kolbicz/WQFiles v0.8（commit 3f47953）。界面 526 条字符串已译为简体中文；功能、Bundle ID、签名方式与上游一致。推送到 main 后由 `.github/workflows/build-zh-ipa.yml` 在 macOS runner 上跑上游测试套件并编译出无签名 IPA，发布到 Release `v0.8-zh-CN`。
+> 简体中文汉化版，基于上游 kolbicz/WQFiles v0.8-b36 测试版（commit f149ba8）。界面 612 条字符串已译为简体中文；功能、Bundle ID、签名方式与上游一致。推送到 main 后由 `.github/workflows/build-zh-ipa.yml` 在 macOS runner 上跑上游测试套件并编译出无签名 IPA，发布到 Release `v0.8-b36-zh-CN`。
 
 # Worse Query Files
 
@@ -47,17 +47,26 @@ new files.
 - **Apps**: every app with its data size. Back up an app's **Documents and
   Library**, restore the latest backup, clear its data (Documents, Library,
   and tmp), open its folder, or share a backup as a ZIP over AirDrop, Files,
-  Mail and so on. `tmp` is intentionally ephemeral: clear removes it, but app
+  Mail and so on. Show all apps, only Apple's, only others or only backed-up
+  ones; long-press to copy the bundle ID or container path. `tmp` is intentionally ephemeral: clear removes it, but app
   backups do not include it and restore leaves the current `tmp` untouched.
 - **Cache Cleaner**: cache and temp size per app, with search, Select All /
   None / Large Caches (50 MB+) and crash logs. Long-press an app to jump to its
   Caches, tmp or data folder.
 - **Files**: browse, read and share files; each opens in the fitting tool,
   and **Open As** switches between them. Saving writes back in place (same
-  inode, owner and attributes). Create folders, import files, rename and
+  inode, owner and attributes). Create folders, import files (several at
+  once) or whole folders with everything inside, rename and
   delete (long-press, or swipe a row left or right; deleting always asks
   first). Sort by name, date modified, date created or size from the •••
   menu; long lists sorted by name get an A–Z sidebar. Long-press a folder to share it as a ZIP.
+  - **Select** (top right) several items to move, compress or delete them
+    together. **Move** works across apps: pick the items, open the target
+    folder in any app's data, tap **Move Here**. Existing items are never
+    replaced.
+  - **Compress** creates a ZIP next to the items; **Extract** (long-press a
+    .zip) unpacks it into a new folder. Entries that would land outside that
+    folder, encrypted ZIPs and symbolic links are refused or left out.
   - **Plist editor**: browse dictionaries and arrays, edit values by type
     (switches for booleans, numbers, text, dates, data as hex), add, delete,
     rename and reorder. Saves in the file's own format (binary or XML).
@@ -68,6 +77,8 @@ new files.
     single rows in full, read-only SQL queries and CSV export. It works on a
     copy of the database and its `-wal` file, so the app's own files are never
     changed; close the app first for an up-to-date copy.
+  - **Media player**: audio and video (mp3, m4a, wav, mp4, mov…) play in the
+    system player. The file is copied to WQ Files' temporary folder first.
   - **Text and images**: text is editable, images render, plists can also be
     edited as XML text.
 - **Log**: file writes, backups, deletions, restores and errors the app handled, plus the App Group it received.
@@ -132,7 +143,14 @@ and only change what you understand.
 
 ## Install with AltStore or SideStore
 
-Add this source to get WQ Files and its updates:
+<h3 align="center">
+<a href="https://altdirect.app/?url=https://raw.githubusercontent.com/kolbicz/WQFiles/main/source.json"><img src="https://altdirect.app/assets/png/AltSource_Blue.png" width="200"></a>
+&nbsp;
+<a href="https://github.com/kolbicz/WQFiles/releases/latest/download/WQFiles.ipa"><img src="https://altdirect.app/assets/png/Download_Blue.png" width="200"></a>
+</h3>
+
+Tap **Add AltSource** on your iPhone to add the source in AltStore, SideStore,
+LiveContainer and others (via [AltDirect](https://altdirect.app)), or add it by hand:
 
 ```
 https://raw.githubusercontent.com/kolbicz/WQFiles/main/source.json

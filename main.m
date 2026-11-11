@@ -24,6 +24,10 @@
 #import "WQPlistEditorSupport.h"
 #import "WQHexViewer.h"
 #import "WQSQLiteViewer.h"
+#import "WQArchive.h"
+#import <AVKit/AVKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <sys/mount.h>
 
 static BOOL wq_looks_like_uuid(NSString *name)
 {
@@ -61,7 +65,7 @@ static BOOL wq_regular_file_for_ui(NSString *path)
 
 #pragma mark - File viewer
 
-typedef NS_ENUM(NSInteger, WQOpenMode) { WQOpenAuto, WQOpenPlist, WQOpenText, WQOpenHex, WQOpenSQLite };
+typedef NS_ENUM(NSInteger, WQOpenMode) { WQOpenAuto, WQOpenPlist, WQOpenText, WQOpenHex, WQOpenSQLite, WQOpenMedia };
 // Opens a file in the fitting viewer (Auto: chosen from its first bytes).
 static void wq_open_file(UINavigationController *nav, NSString *path, BOOL readOnly, WQOpenMode mode);
 
@@ -174,6 +178,8 @@ static NSString *wq_file_hex_dump(NSData *data, BOOL truncated)
                           handler:^(UIAction *__unused a) { [weakSelf reopenAs:WQOpenHex]; }],
         [UIAction actionWithTitle:@"SQLite 查看器" image:[UIImage systemImageNamed:@"tablecells"] identifier:nil
                           handler:^(UIAction *__unused a) { [weakSelf reopenAs:WQOpenSQLite]; }],
+        [UIAction actionWithTitle:@"媒体播放器" image:[UIImage systemImageNamed:@"play.rectangle"] identifier:nil
+                          handler:^(UIAction *__unused a) { [weakSelf reopenAs:WQOpenMedia]; }],
     ]];
     UIBarButtonItem *more = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"] menu:openAs];
     self.navigationItem.rightBarButtonItems = @[share, more];
@@ -439,6 +445,53 @@ static WQOpenMode wq_sniff(NSData *head)
 
 static NSUInteger wq_open_generation;
 
+// Audio and video by extension (the first bytes of MP4/MOV look like HEIC images).
+static BOOL wq_is_media_name(NSString *name)
+{
+    static NSSet<NSString *> *exts;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        exts = [NSSet setWithArray:@[@"mp3", @"m4a", @"m4b", @"aac", @"wav", @"aif", @"aiff", @"caf", @"flac", @"alac",
+                                     @"mp4", @"m4v", @"mov", @"3gp", @"3g2", @"m3u8"]];
+    });
+    return [exts containsObject:name.pathExtension.lowercaseString];
+}
+
+// The system player decodes in a separate process that can't read other
+// apps' folders, so the file is copied to WQ Files' temporary folder first
+// (the previous copy is removed).
+static void wq_open_media(UINavigationController *nav, NSString *path, BOOL (^stillWanted)(void))
+{
+    UIViewController *host = nav.topViewController;
+    UIAlertController *hud = [UIAlertController alertControllerWithTitle:@"正在准备…" message:path.lastPathComponent
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+    [host presentViewController:hud animated:YES completion:nil];
+    dispatch_async(wq_io(), ^{
+        NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"wq-media"];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        [fm removeItemAtPath:dir error:nil];
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *local = [dir stringByAppendingPathComponent:path.lastPathComponent];
+        NSString *error = nil;
+        BOOL ok = wq_copy_to_local(path, local, &error);
+        wq_log(@"media: %@ -> %@", path, ok ? @"好" : error);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            void (^show)(void) = ^{
+                if (!ok) { wq_alert(host, @"无法播放", error ?: @"无法读取文件。"); return; }
+                if (!stillWanted()) return;
+                [AVAudioSession.sharedInstance setCategory:AVAudioSessionCategoryPlayback error:nil];
+                AVPlayerViewController *player = [AVPlayerViewController new];
+                player.player = [AVPlayer playerWithURL:[NSURL fileURLWithPath:local]];
+                player.title = path.lastPathComponent;
+                [nav pushViewController:player animated:YES];
+                [player.player play];
+            };
+            if (host.presentedViewController == hud) [host dismissViewControllerAnimated:YES completion:show];
+            else show();
+        });
+    });
+}
+
 static void wq_open_file(UINavigationController *nav, NSString *path, BOOL readOnly, WQOpenMode mode)
 {
     if (!nav || !path.length) return;
@@ -449,6 +502,10 @@ static void wq_open_file(UINavigationController *nav, NSString *path, BOOL readO
     UIViewController *origin = nav.topViewController;
     void (^push)(WQOpenMode) = ^(WQOpenMode m) {
         if (request != wq_open_generation || nav.topViewController != origin) return;
+        if (m == WQOpenMedia) {
+            wq_open_media(nav, path, ^BOOL { return request == wq_open_generation && nav.topViewController == origin; });
+            return;
+        }
         UIViewController *vc;
         if (m == WQOpenPlist) {
             WQPlistEditorViewController *editor = [[WQPlistEditorViewController alloc] initWithPath:path readOnly:readOnly];
@@ -476,6 +533,7 @@ static void wq_open_file(UINavigationController *nav, NSString *path, BOOL readO
                                 : @"只能查看常规文件。");
         return;
     }
+    if (mode == WQOpenAuto && wq_is_media_name(path)) mode = WQOpenMedia;
     if (mode != WQOpenAuto) { push(mode); return; }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSData *head = wq_permission_hint(path, NO) ? nil : wq_read_range(path, 0, 4096, NULL);
@@ -573,6 +631,37 @@ static NSString *wq_index_letter(NSString *name)
     return (c >= 'A' && c <= 'Z') ? [NSString stringWithCharacters:&c length:1] : @"#";
 }
 
+// Items picked with Move, waiting for "Move Here" in another folder.
+static NSArray<NSString *> *gWQMovePaths;
+static NSString *const kWQMoveChanged = @"WQMoveChanged";
+
+static void wq_set_move_paths(NSArray<NSString *> *paths)
+{
+    gWQMovePaths = paths.count ? [paths copy] : nil;
+    [NSNotificationCenter.defaultCenter postNotificationName:kWQMoveChanged object:nil];
+}
+
+// ZIP reading and writing through WQAccess, so other apps' files work too.
+static WQArchiveIO *wq_app_archive_io(void)
+{
+    WQArchiveIO *io = [WQArchiveIO new];
+    io.stat = ^BOOL(NSString *path, struct stat *st) { return wq_stat(path, st); };
+    io.list = ^NSArray<NSString *> *(NSString *dir) { return wq_list(dir, NULL); };
+    io.openRead = ^int(NSString *path) { return wq_open_for_reading(path); };
+    return io;
+}
+
+static NSString *wq_temp_work_dir(NSString *prefix)
+{
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                     [NSString stringWithFormat:@"%@-%@", prefix, NSUUID.UUID.UUIDString]];
+    return [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil] ? dir : nil;
+}
+
+@interface WQDirViewController ()
+- (BOOL)wq_wantsToolbar;
+@end
+
 @implementation WQDirViewController {
     NSString *_path;
     NSArray<WQItem *> *_all;     // everything in the folder
@@ -601,6 +690,12 @@ static NSString *wq_index_letter(NSString *name)
     NSTimeInterval _lastReloadFinished;
     NSArray<NSString *> *_indexTitles;          // sidebar letters, when sorted by name
     NSDictionary<NSString *, NSNumber *> *_indexRows;   // letter -> first row
+    BOOL _selectingFiles;
+    BOOL _importingFolder;
+    NSMutableOrderedSet<NSString *> *_selectedFiles;
+    UIBarButtonItem *_fileSelectItem;
+    UIBarButtonItem *_fileDoneItem;
+    UIBarButtonItem *_fileAllItem;
 }
 
 - (instancetype)initWithPath:(NSString *)path title:(NSString *)title
@@ -610,6 +705,7 @@ static NSString *wq_index_letter(NSString *name)
         self.title = title ?: (path.lastPathComponent.length ? path.lastPathComponent : @"/");
         _baseTitle = self.title;
         _selectedBackups = [NSMutableSet new];
+        _selectedFiles = [NSMutableOrderedSet new];
         // Container parents: show bundle/group identifiers instead of UUIDs.
         NSString *parent = path.lastPathComponent;
         _labels = [@[@"Application", @"AppGroup", @"PluginKitPlugin", @"InternalDaemon", @"System"] containsObject:parent];
@@ -636,6 +732,8 @@ static NSString *wq_index_letter(NSString *name)
                           handler:^(UIAction *__unused a) { [weakSelf promptNewFolder]; }]];
         [menuItems addObject:[UIAction actionWithTitle:@"导入文件" image:[UIImage systemImageNamed:@"square.and.arrow.down"] identifier:nil
                           handler:^(UIAction *__unused a) { [weakSelf importFile]; }]];
+        [menuItems addObject:[UIAction actionWithTitle:@"导入文件夹" image:[UIImage systemImageNamed:@"folder.badge.plus"] identifier:nil
+                          handler:^(UIAction *__unused a) { [weakSelf importFolder]; }]];
     }
     [menuItems addObject:[UIAction actionWithTitle:@"复制路径" image:[UIImage systemImageNamed:@"doc.on.doc"] identifier:nil
                           handler:^(UIAction *__unused a) { UIPasteboard.generalPasteboard.string = path; }]];
@@ -673,10 +771,14 @@ static NSString *wq_index_letter(NSString *name)
         _selectItem = [[UIBarButtonItem alloc] initWithTitle:@"选择" style:UIBarButtonItemStylePlain
                                                        target:self action:@selector(enterBackupSelection)];
         _selectItem.enabled = NO;
-        self.navigationItem.rightBarButtonItems = @[_selectItem, _menuItem];
-    } else {
-        self.navigationItem.rightBarButtonItem = _menuItem;
+    } else if ([self canEditHere]) {
+        _fileSelectItem = [[UIBarButtonItem alloc] initWithTitle:@"选择" style:UIBarButtonItemStylePlain
+                                                           target:self action:@selector(enterFileSelection)];
     }
+    [self restoreRightItems];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(updateToolbar)
+                                               name:kWQMoveChanged object:nil];
+    [self updateToolbar];
     [self updateHeader];
     UISearchController *search = [[UISearchController alloc] initWithSearchResultsController:nil];
     search.searchResultsUpdater = self;
@@ -693,6 +795,7 @@ static NSString *wq_index_letter(NSString *name)
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    [self updateToolbar];
     if (_scanInFlight) return;
     NSTimeInterval age = NSDate.date.timeIntervalSinceReferenceDate - _lastReloadFinished;
     if (_scanNeedsRefresh || _lastReloadFinished <= 0 || age > 2.0) [self reload];
@@ -702,6 +805,7 @@ static NSString *wq_index_letter(NSString *name)
 {
     [super viewWillDisappear:animated];
     if (_selectingBackups) [self exitBackupSelection];
+    if (_selectingFiles) [self exitFileSelection];
     if (_scanInFlight) {
         _scanNeedsRefresh = YES;
         [_scanCancellation cancel];
@@ -803,7 +907,7 @@ static NSString *wq_index_letter(NSString *name)
 
 - (NSArray<NSString *> *)sectionIndexTitlesForTableView:(UITableView *)tableView
 {
-    return _selectingBackups || _error ? nil : _indexTitles;
+    return _selectingBackups || _selectingFiles || _error ? nil : _indexTitles;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView sectionForSectionIndexTitle:(NSString *)title atIndex:(NSInteger)index
@@ -878,8 +982,7 @@ static NSString *wq_index_letter(NSString *name)
     self.tableView.allowsMultipleSelection = NO;
     self.refreshControl.enabled = YES;
     self.title = _baseTitle;
-    self.navigationItem.rightBarButtonItems = _backupStorage ? @[_selectItem, _menuItem] : nil;
-    if (!_backupStorage) self.navigationItem.rightBarButtonItem = _menuItem;
+    [self restoreRightItems];
     [self.tableView reloadData];
     [self updateBackupSelectionAvailability];
 }
@@ -921,6 +1024,321 @@ static NSString *wq_index_letter(NSString *name)
         } failure:@"无法删除备份"];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark File selection, Move, Compress, Extract
+
+// Ordinary folders where files may be created, moved and deleted: not
+// read-only areas, not backup storage, not the container lists themselves.
+- (BOOL)canEditHere
+{
+    return !self.readOnly && !_backupStorage && !_labels;
+}
+
+- (void)restoreRightItems
+{
+    if (_backupStorage && _selectItem) self.navigationItem.rightBarButtonItems = @[_selectItem, _menuItem];
+    else if (_fileSelectItem) self.navigationItem.rightBarButtonItems = @[_fileSelectItem, _menuItem];
+    else self.navigationItem.rightBarButtonItems = @[_menuItem];
+}
+
+- (BOOL)wq_wantsToolbar
+{
+    return _selectingFiles || gWQMovePaths.count > 0;
+}
+
+- (BOOL)canMoveHere
+{
+    if (![self canEditHere] || _error || !gWQMovePaths.count) return NO;
+    for (NSString *path in gWQMovePaths) {
+        if ([path.stringByDeletingLastPathComponent isEqualToString:_path]) return NO;
+        if ([_path isEqualToString:path] || [_path hasPrefix:[path stringByAppendingString:@"/"]]) return NO;
+    }
+    return YES;
+}
+
+- (void)updateToolbar
+{
+    _fileSelectItem.enabled = !_error && _all.count > 0;
+    UIBarButtonItem *flex = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+    if (_selectingFiles) {
+        BOOL any = _selectedFiles.count > 0;
+        UIBarButtonItem *move = [[UIBarButtonItem alloc] initWithTitle:@"移动" style:UIBarButtonItemStylePlain
+                                                                target:self action:@selector(moveSelectedFiles)];
+        UIBarButtonItem *zip = [[UIBarButtonItem alloc] initWithTitle:@"压缩" style:UIBarButtonItemStylePlain
+                                                               target:self action:@selector(compressSelectedFiles)];
+        UIBarButtonItem *del = [[UIBarButtonItem alloc] initWithTitle:@"删除" style:UIBarButtonItemStylePlain
+                                                               target:self action:@selector(deleteSelectedFiles)];
+        del.tintColor = UIColor.systemRedColor;
+        move.enabled = zip.enabled = del.enabled = any;
+        self.toolbarItems = @[move, flex, zip, flex, del];
+    } else if (gWQMovePaths.count) {
+        UIBarButtonItem *cancel = [[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain
+                                                                  target:self action:@selector(cancelMove)];
+        UILabel *label = [UILabel new];
+        label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+        label.textColor = UIColor.secondaryLabelColor;
+        label.text = gWQMovePaths.count == 1
+            ? [NSString stringWithFormat:@"正在移动“%@”", gWQMovePaths.firstObject.lastPathComponent]
+            : [NSString stringWithFormat:@"正在移动 %lu 个项目", (unsigned long)gWQMovePaths.count];
+        label.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [label sizeToFit];
+        CGRect frame = label.frame;
+        frame.size.width = MIN(frame.size.width, 180);
+        label.frame = frame;
+        UIBarButtonItem *info = [[UIBarButtonItem alloc] initWithCustomView:label];
+        UIBarButtonItem *here = [[UIBarButtonItem alloc] initWithTitle:@"移至此处" style:UIBarButtonItemStyleProminent
+                                                                target:self action:@selector(moveHere)];
+        here.enabled = [self canMoveHere];
+        self.toolbarItems = @[cancel, flex, info, flex, here];
+    } else {
+        self.toolbarItems = nil;
+    }
+    if (self.navigationController.topViewController == self)
+        [self.navigationController setToolbarHidden:![self wq_wantsToolbar] animated:YES];
+}
+
+- (void)updateFileSelectionTitle
+{
+    self.title = _selectedFiles.count
+        ? [NSString stringWithFormat:@"已选 %lu 个", (unsigned long)_selectedFiles.count] : @"选择项目";
+    _fileAllItem.enabled = _selectedFiles.count < _items.count;
+    [self updateToolbar];
+}
+
+- (void)enterFileSelection
+{
+    if (_error || _items.count == 0) return;
+    _selectingFiles = YES;
+    [_selectedFiles removeAllObjects];
+    if (!_fileDoneItem) {
+        _fileDoneItem = [[UIBarButtonItem alloc] initWithTitle:@"完成" style:UIBarButtonItemStyleProminent
+                                                        target:self action:@selector(exitFileSelection)];
+        _fileAllItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"checkmark.circle"]
+                                                         style:UIBarButtonItemStylePlain
+                                                        target:self action:@selector(selectAllFiles)];
+        _fileAllItem.accessibilityLabel = @"全选";
+    }
+    self.refreshControl.enabled = NO;
+    self.navigationItem.rightBarButtonItems = @[_fileDoneItem, _fileAllItem];
+    [self updateFileSelectionTitle];
+    [self.tableView reloadData];
+    [self.tableView reloadSectionIndexTitles];
+}
+
+- (void)exitFileSelection
+{
+    if (!_selectingFiles) return;
+    _selectingFiles = NO;
+    [_selectedFiles removeAllObjects];
+    self.refreshControl.enabled = YES;
+    self.title = _baseTitle;
+    [self restoreRightItems];
+    [self updateToolbar];
+    [self.tableView reloadData];
+    [self.tableView reloadSectionIndexTitles];
+}
+
+- (void)selectAllFiles
+{
+    for (WQItem *item in _items) [_selectedFiles addObject:item.path];
+    [self updateFileSelectionTitle];
+    [self.tableView reloadData];
+}
+
+- (NSArray<NSString *> *)selectedFilePaths
+{
+    return _selectedFiles.array.copy;
+}
+
+- (void)moveSelectedFiles
+{
+    NSArray<NSString *> *paths = [self selectedFilePaths];
+    if (!paths.count) return;
+    [self exitFileSelection];
+    [self startMove:paths];
+}
+
+- (void)startMove:(NSArray<NSString *> *)paths
+{
+    wq_set_move_paths(paths);
+    wq_alert(self, paths.count == 1 ? @"移动" : [NSString stringWithFormat:@"移动 %lu 个项目", (unsigned long)paths.count],
+             @"打开要移入的文件夹，然后点按底部的“移至此处”。任意应用的文件夹都可以。");
+}
+
+- (void)cancelMove
+{
+    wq_set_move_paths(nil);
+}
+
+- (void)moveHere
+{
+    NSArray<NSString *> *paths = gWQMovePaths;
+    if (![self canMoveHere]) return;
+    NSString *dest = _path;
+    wq_set_move_paths(nil);
+    [self runIO:^BOOL(NSString **error) {
+        NSUInteger failed = 0;
+        NSString *first = nil;
+        for (NSString *path in paths) {
+            NSString *e = nil;
+            if (!wq_move(path, dest, &e)) {
+                failed++;
+                if (!first) first = [NSString stringWithFormat:@"%@: %@", path.lastPathComponent, e ?: @"失败"];
+            }
+        }
+        if (failed && error) {
+            *error = paths.count == 1 ? first
+                : [NSString stringWithFormat:@"未能移动 %lu 个项目，共 %lu 个。\n\n%@", (unsigned long)failed, (unsigned long)paths.count, first];
+        }
+        return failed == 0;
+    } failure:@"无法移动"];
+}
+
+- (void)deleteSelectedFiles
+{
+    NSArray<NSString *> *paths = [self selectedFilePaths];
+    if (!paths.count) return;
+    NSString *title = paths.count == 1 ? [NSString stringWithFormat:@"删除“%@”？", paths.firstObject.lastPathComponent]
+                                       : [NSString stringWithFormat:@"删除 %lu 个项目？", (unsigned long)paths.count];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+        message:@"文件会先复制到 Backups，文件夹仅在为空时才会被删除。"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *__unused a) {
+        [self exitFileSelection];
+        [self runIO:^BOOL(NSString **error) {
+            NSUInteger failed = 0;
+            NSString *first = nil;
+            for (NSString *path in paths) {
+                NSString *e = nil;
+                if (!wq_delete(path, &e)) {
+                    failed++;
+                    if (!first) first = [NSString stringWithFormat:@"%@: %@", path.lastPathComponent, e ?: @"失败"];
+                }
+            }
+            if (failed && error) {
+                *error = paths.count == 1 ? first
+                    : [NSString stringWithFormat:@"未能删除 %lu 个项目，共 %lu 个。\n\n%@", (unsigned long)failed, (unsigned long)paths.count, first];
+            }
+            return failed == 0;
+        } failure:@"无法删除"];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// "Name.zip", or "Name 2.zip" when that is taken in this folder.
+- (NSString *)unusedName:(NSString *)base extension:(NSString *)extension
+{
+    NSMutableSet<NSString *> *taken = [NSMutableSet new];
+    for (WQItem *item in _all) [taken addObject:item.name.lowercaseString];
+    for (NSUInteger n = 1; n < 10000; n++) {
+        NSString *stem = n == 1 ? base : [NSString stringWithFormat:@"%@ %lu", base, (unsigned long)n];
+        NSString *name = extension.length ? [stem stringByAppendingPathExtension:extension] : stem;
+        if (![taken containsObject:name.lowercaseString]) return name;
+    }
+    return [NSString stringWithFormat:@"%@ %@", base, NSUUID.UUID.UUIDString];
+}
+
+// Runs a long ZIP job with a progress alert that can cancel it.
+- (void)runArchiveJob:(NSString *)title failure:(NSString *)failureTitle
+                 work:(BOOL (^)(WQArchiveCancelled cancelled, WQArchiveProgress progress, NSString **error, NSString **note))work
+{
+    WQScanCancellation *cancellation = [WQScanCancellation new];
+    UIAlertController *hud = [UIAlertController alertControllerWithTitle:title message:@"正在开始…"
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+    [hud addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                          handler:^(UIAlertAction *__unused a) { [cancellation cancel]; }]];
+    [self presentViewController:hud animated:YES completion:nil];
+    __block CFAbsoluteTime lastUpdate = 0;
+    WQArchiveProgress progress = ^(unsigned long long bytes) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - lastUpdate < 0.25) return;
+        lastUpdate = now;
+        NSString *text = wq_size_text(bytes);
+        dispatch_async(dispatch_get_main_queue(), ^{ hud.message = text; });
+    };
+    WQArchiveCancelled cancelled = ^BOOL { return cancellation.isCancelled; };
+    dispatch_async(wq_io(), ^{
+        NSString *error = nil, *note = nil;
+        BOOL ok = work(cancelled, progress, &error, &note);
+        BOOL wasCancelled = cancellation.isCancelled;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            void (^finish)(void) = ^{
+                if (!ok && !wasCancelled) wq_alert(self, failureTitle, error ?: @"未知错误");
+                else if (ok && note) wq_alert(self, title, note);
+                [self reload];
+            };
+            if (self.presentedViewController == hud) [self dismissViewControllerAnimated:YES completion:finish];
+            else finish();
+        });
+    });
+}
+
+- (void)compressSelectedFiles
+{
+    NSArray<NSString *> *paths = [self selectedFilePaths];
+    if (!paths.count) return;
+    [self exitFileSelection];
+    [self compressPaths:paths];
+}
+
+- (void)compressPaths:(NSArray<NSString *> *)paths
+{
+    NSString *base = paths.count == 1 ? paths.firstObject.lastPathComponent : @"Archive";
+    NSString *zipName = [self unusedName:base extension:@"zip"];
+    NSString *dest = [_path stringByAppendingPathComponent:zipName];
+    [self runArchiveJob:@"正在压缩" failure:@"无法压缩"
+                   work:^BOOL(WQArchiveCancelled cancelled, WQArchiveProgress progress, NSString **error, NSString **note) {
+        NSString *work = wq_temp_work_dir(@"wq-zip");
+        if (!work) { *error = @"无法创建临时文件夹"; return NO; }
+        NSString *local = [work stringByAppendingPathComponent:zipName];
+        NSUInteger skipped = 0;
+        BOOL ok = wq_zip_write(paths, local, wq_app_archive_io(), cancelled, progress, &skipped, error);
+        if (ok && cancelled()) ok = NO;
+        if (ok) ok = wq_create_file_from(dest, local, error);
+        [NSFileManager.defaultManager removeItemAtPath:work error:nil];
+        wq_log(@"compress: %lu item(s) -> %@: %@", (unsigned long)paths.count, dest, ok ? @"好" : *error);
+        if (ok && skipped)
+            *note = [NSString stringWithFormat:@"已创建 %@。%lu 个符号链接%@或特殊文件%@未包含在内。",
+                     zipName, (unsigned long)skipped, skipped == 1 ? @"" : @"", skipped == 1 ? @"" : @""];
+        return ok;
+    }];
+}
+
+- (void)extractZip:(NSString *)zipPath
+{
+    NSString *base = zipPath.lastPathComponent.stringByDeletingPathExtension;
+    NSString *folder = [self unusedName:base.length ? base : @"Archive" extension:nil];
+    NSString *dest = [_path stringByAppendingPathComponent:folder];
+    [self runArchiveJob:@"正在解压" failure:@"无法解压"
+                   work:^BOOL(WQArchiveCancelled cancelled, WQArchiveProgress progress, NSString **error, NSString **note) {
+        NSString *work = wq_temp_work_dir(@"wq-unzip");
+        if (!work) { *error = @"无法创建临时文件夹"; return NO; }
+        NSString *local = [work stringByAppendingPathComponent:folder];
+        [NSFileManager.defaultManager createDirectoryAtPath:local withIntermediateDirectories:NO attributes:nil error:nil];
+        // The files exist twice for a moment (temporary copy, then in place).
+        struct statfs fs;
+        unsigned long long available = statfs(work.fileSystemRepresentation, &fs) == 0
+            ? (unsigned long long)fs.f_bavail * fs.f_bsize : 0;
+        unsigned long long reserve = 256ull * 1024 * 1024;
+        unsigned long long limit = available > reserve ? (available - reserve) / 2 : 0;
+        NSUInteger files = 0, skipped = 0;
+        BOOL ok = wq_zip_extract(zipPath, local, wq_app_archive_io(), limit, cancelled, progress, &files, &skipped, error);
+        if (ok && cancelled()) ok = NO;
+        if (ok) ok = wq_create_dir(dest, error);
+        if (ok && !wq_copy_contents(local, dest, error)) {
+            ok = NO;
+            *error = [NSString stringWithFormat:@"%@\n\n部分文件可能已在 %@ 中。", *error ?: @"复制失败。", folder];
+        }
+        [NSFileManager.defaultManager removeItemAtPath:work error:nil];
+        wq_log(@"extract: %@ -> %@: %@ (%lu files, %lu skipped)", zipPath, dest, ok ? @"好" : *error,
+               (unsigned long)files, (unsigned long)skipped);
+        if (ok && skipped)
+            *note = [NSString stringWithFormat:@"已将 %lu 个文件%@解压到 %@。ZIP 中 %lu 个符号链接%@未包含在内。",
+                     (unsigned long)files, files == 1 ? @"" : @"", folder, (unsigned long)skipped, skipped == 1 ? @"" : @""];
+        return ok;
+    }];
 }
 
 // Pull to refresh: container lists are scanned again instead of reused.
@@ -1043,7 +1461,15 @@ static NSString *wq_index_letter(NSString *name)
                     wq_log(@"label: no token for %@", item.path);
                     labelIssues++;
                 } else if (token && !bid.length && labelIssues < 3) {
-                    wq_log(@"label: no container identifier for %@", item.path);
+                    // Once per container per launch; refreshes would repeat it.
+                    static NSMutableSet<NSString *> *reported;
+                    @synchronized ([WQItem class]) {
+                        if (!reported) reported = [NSMutableSet new];
+                        if (![reported containsObject:item.path]) {
+                            [reported addObject:item.path];
+                            wq_log(@"label: no container identifier for %@", item.path);
+                        }
+                    }
                     labelIssues++;
                 }
             }
@@ -1098,6 +1524,7 @@ static NSString *wq_index_letter(NSString *name)
             [self applyFilter];
             self->_error = (names || childPaths != nil) ? nil
                 : (error.length ? error
+                   : !wq_app_group() ? @"WQ Files 没有 App Group，因此无法打开其他应用的文件夹。请使用保留 App Group 的工具重新签名（见 README 中的 Signing）。"
                    : wq_full_scan_was_declined() ? @"尚未列出：需要扫描全部文件。下拉即可开始。"
                    : @"无法列出此文件夹。容器枚举失败；见“日志”。");
             self->_scanStatus = nil;
@@ -1107,6 +1534,14 @@ static NSString *wq_index_letter(NSString *name)
             [self.tableView reloadData];
             [self updateBackupSelectionAvailability];
             if (self->_selectingBackups) [self updateBackupSelectionBar];
+            if (self->_selectingFiles) {
+                NSMutableSet<NSString *> *present = [NSMutableSet new];
+                for (WQItem *item in items) [present addObject:item.path];
+                for (NSString *path in self->_selectedFiles.array.copy)
+                    if (![present containsObject:path]) [self->_selectedFiles removeObject:path];
+                [self updateFileSelectionTitle];
+            }
+            [self updateToolbar];
         });
     });
 }
@@ -1146,7 +1581,11 @@ static NSString *wq_index_letter(NSString *name)
     c.image = appIcon ?: [UIImage systemImageNamed:item.isDir ? @"folder.fill" : (item.isLink ? @"link" : @"doc")];
     if (appIcon) c.imageProperties.maximumSize = CGSizeMake(36, 36);
     cell.contentConfiguration = c;
-    if (_selectingBackups) {
+    if (_selectingFiles) {
+        cell.accessoryType = [_selectedFiles containsObject:item.path]
+            ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    } else if (_selectingBackups) {
         BOOL selectable = wq_backup_unit_deletable(item.path);
         cell.accessoryType = selectable && [_selectedBackups containsObject:item.path]
             ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
@@ -1168,6 +1607,16 @@ static NSString *wq_index_letter(NSString *name)
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
+    if (_selectingFiles) {
+        [tableView deselectRowAtIndexPath:indexPath animated:NO];
+        if (indexPath.section != 0 || (NSUInteger)indexPath.row >= _items.count) return;
+        NSString *path = _items[(NSUInteger)indexPath.row].path;
+        if ([_selectedFiles containsObject:path]) [_selectedFiles removeObject:path];
+        else [_selectedFiles addObject:path];
+        [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+        [self updateFileSelectionTitle];
+        return;
+    }
     if (_selectingBackups) {
         if (indexPath.section != 0 || (NSUInteger)indexPath.row >= _items.count) return;
         WQItem *selected = _items[(NSUInteger)indexPath.row];
@@ -1219,7 +1668,7 @@ static NSString *wq_index_letter(NSString *name)
 // long-press menu (files are backed up first; backups only as whole units).
 - (UISwipeActionsConfiguration *)deleteSwipeForRowAtIndexPath:(NSIndexPath *)indexPath
 {
-    if (_selectingBackups || _error) return nil;
+    if (_selectingBackups || _selectingFiles || _error) return nil;
     if (indexPath.section != 0 || (NSUInteger)indexPath.row >= _items.count) return nil;
     WQItem *item = _items[(NSUInteger)indexPath.row];
     BOOL backupUnit = item.isDir && wq_backup_unit_deletable(item.path);
@@ -1261,7 +1710,7 @@ static NSString *wq_index_letter(NSString *name)
 - (UIContextMenuConfiguration *)tableView:(UITableView *)tableView
     contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point
 {
-    if (_selectingBackups || _error) return nil;
+    if (_selectingBackups || _selectingFiles || _error) return nil;
     if (indexPath.section != 0 || (NSUInteger)indexPath.row >= _items.count) return nil;
     WQItem *item = _items[(NSUInteger)indexPath.row];
     NSString *itemPath = [item.path copy];
@@ -1315,6 +1764,8 @@ static NSString *wq_index_letter(NSString *name)
                                   handler:^(UIAction *__unused a) { WQDirViewController *strongSelf = weakSelf; WQItem *latest = currentItem(); if (strongSelf && latest) wq_open_file(strongSelf.navigationController, latest.path, ro, WQOpenHex); }],
                 [UIAction actionWithTitle:@"SQLite 查看器" image:[UIImage systemImageNamed:@"tablecells"] identifier:nil
                                   handler:^(UIAction *__unused a) { WQDirViewController *strongSelf = weakSelf; WQItem *latest = currentItem(); if (strongSelf && latest) wq_open_file(strongSelf.navigationController, latest.path, ro, WQOpenSQLite); }],
+                [UIAction actionWithTitle:@"媒体播放器" image:[UIImage systemImageNamed:@"play.rectangle"] identifier:nil
+                                  handler:^(UIAction *__unused a) { WQDirViewController *strongSelf = weakSelf; WQItem *latest = currentItem(); if (strongSelf && latest) wq_open_file(strongSelf.navigationController, latest.path, ro, WQOpenMedia); }],
             ]]];
         }
         [actions addObject:[UIAction actionWithTitle:@"复制路径" image:[UIImage systemImageNamed:@"doc.on.doc"]
@@ -1337,6 +1788,26 @@ static NSString *wq_index_letter(NSString *name)
             }];
             remove.attributes = UIMenuElementAttributesDestructive;
             [actions addObject:remove];
+        }
+        if ([strongSelf canEditHere]) {
+            if (!current.isDir && current.isRegular &&
+                [current.name.pathExtension caseInsensitiveCompare:@"zip"] == NSOrderedSame) {
+                [actions addObject:[UIAction actionWithTitle:@"解压" image:[UIImage systemImageNamed:@"archivebox"]
+                                                  identifier:nil handler:^(UIAction *__unused a) {
+                    WQItem *latest = currentItem();
+                    if (latest) [weakSelf extractZip:latest.path];
+                }]];
+            }
+            [actions addObject:[UIAction actionWithTitle:@"压缩" image:[UIImage systemImageNamed:@"doc.zipper"]
+                                              identifier:nil handler:^(UIAction *__unused a) {
+                WQItem *latest = currentItem();
+                if (latest) [weakSelf compressPaths:@[latest.path]];
+            }]];
+            [actions addObject:[UIAction actionWithTitle:@"移动…" image:[UIImage systemImageNamed:@"folder"]
+                                              identifier:nil handler:^(UIAction *__unused a) {
+                WQItem *latest = currentItem();
+                if (latest) [weakSelf startMove:@[latest.path]];
+            }]];
         }
         if (!strongSelf.readOnly && !strongSelf->_backupStorage) {
             [actions addObject:[UIAction actionWithTitle:@"重命名" image:[UIImage systemImageNamed:@"pencil"]
@@ -1450,16 +1921,139 @@ static NSString *wq_index_letter(NSString *name)
 {
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
         initForOpeningContentTypes:@[UTTypeItem] asCopy:YES];
+    picker.allowsMultipleSelection = YES;
     picker.delegate = self;
+    _importingFolder = NO;
     [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)importFolder
+{
+    // Folders can't be handed over as a copy; the picker grants temporary
+    // access to the folder itself, which is copied with everything inside.
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+        initForOpeningContentTypes:@[UTTypeFolder] asCopy:NO];
+    picker.allowsMultipleSelection = YES;
+    picker.delegate = self;
+    _importingFolder = YES;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+// A name in dir that nothing uses yet: "Name", "Name 2", … (keeps the extension).
+static NSString *wq_free_name_in(NSString *dir, NSString *name, NSMutableSet<NSString *> *claimed)
+{
+    NSString *ext = name.pathExtension, *stem = name.stringByDeletingPathExtension;
+    if (!stem.length) { stem = name; ext = @""; }
+    for (NSUInteger n = 1; n < 10000; n++) {
+        NSString *candidate = n == 1 ? name : [NSString stringWithFormat:@"%@ %lu", stem, (unsigned long)n];
+        if (n > 1 && ext.length) candidate = [candidate stringByAppendingPathExtension:ext];
+        struct stat st;
+        if ([claimed containsObject:candidate.lowercaseString] ||
+            wq_stat([dir stringByAppendingPathComponent:candidate], &st)) continue;
+        [claimed addObject:candidate.lowercaseString];
+        return candidate;
+    }
+    return nil;
+}
+
+// Shows a progress alert while work runs on the IO queue, then reports.
+- (void)runBusy:(NSString *)title failure:(NSString *)failureTitle
+           work:(BOOL (^)(NSString **error, NSString **note))work
+{
+    UIAlertController *hud = [UIAlertController alertControllerWithTitle:title message:@"请稍候…"
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:hud animated:YES completion:nil];
+    dispatch_async(wq_io(), ^{
+        NSString *error = nil, *note = nil;
+        BOOL ok = work(&error, &note);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            void (^finish)(void) = ^{
+                if (!ok) wq_alert(self, failureTitle, error ?: @"未知错误");
+                else if (note) wq_alert(self, title, note);
+                [self reload];
+            };
+            if (self.presentedViewController == hud) [self dismissViewControllerAnimated:YES completion:finish];
+            else finish();
+        });
+    });
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
 {
+    if (!urls.count) return;
+    if (_importingFolder) { [self importFolders:urls]; return; }
+    // One file: the existing flow, which offers to replace a file of the same name.
+    if (urls.count == 1) { [self importSingleFile:urls.firstObject.path]; return; }
+    // Several files: same-named ones get a free name ("Name 2.ext") instead of
+    // a question per file. The picker's local copies are removed afterwards.
+    NSString *dir = _path;
+    NSArray<NSString *> *sources = [urls valueForKey:@"path"];
+    [self runBusy:@"正在导入" failure:@"导入失败" work:^BOOL(NSString **error, NSString **note) {
+        NSMutableSet<NSString *> *claimed = [NSMutableSet new];
+        NSUInteger done = 0, renamed = 0;
+        NSString *first = nil;
+        for (NSString *source in sources) {
+            NSString *name = wq_free_name_in(dir, source.lastPathComponent, claimed);
+            NSString *e = nil;
+            BOOL ok = name && wq_create_file_from([dir stringByAppendingPathComponent:name], source, &e);
+            [NSFileManager.defaultManager removeItemAtPath:source error:nil];
+            if (ok) { done++; if (![name isEqualToString:source.lastPathComponent]) renamed++; }
+            else if (!first) first = [NSString stringWithFormat:@"%@: %@", source.lastPathComponent, e ?: @"无可用名称"];
+        }
+        wq_log(@"import: %lu of %lu files into %@", (unsigned long)done, (unsigned long)sources.count, dir);
+        if (done < sources.count) {
+            *error = [NSString stringWithFormat:@"已导入 %lu 个文件，共 %lu 个。\n\n%@",
+                      (unsigned long)done, (unsigned long)sources.count, first];
+            return NO;
+        }
+        if (renamed) *note = [NSString stringWithFormat:@"已导入 %lu 个文件，其中 %lu 个因重名被自动加了编号。",
+                              (unsigned long)done, (unsigned long)renamed];
+        return YES;
+    }];
+}
+
+- (void)importFolders:(NSArray<NSURL *> *)urls
+{
+    NSString *dir = _path;
+    [self runBusy:@"正在导入" failure:@"导入失败" work:^BOOL(NSString **error, NSString **note) {
+        NSMutableSet<NSString *> *claimed = [NSMutableSet new];
+        NSMutableArray<NSString *> *renamed = [NSMutableArray new];
+        for (NSURL *url in urls) {
+            BOOL scoped = [url startAccessingSecurityScopedResource];
+            NSString *name = wq_free_name_in(dir, url.lastPathComponent, claimed);
+            __block BOOL ok = NO;
+            __block NSString *e = nil;
+            if (name) {
+                NSString *dest = [dir stringByAppendingPathComponent:name];
+                // A coordinated read makes cloud folders download first.
+                NSError *coordError = nil;
+                [[NSFileCoordinator new] coordinateReadingItemAtURL:url options:0 error:&coordError byAccessor:^(NSURL *readable) {
+                    NSString *copyError = nil;
+                    ok = wq_create_dir(dest, &copyError) && wq_copy_contents(readable.path, dest, &copyError);
+                    e = copyError;
+                }];
+                if (coordError) e = e ?: coordError.localizedDescription;
+                if (!ok && e && wq_stat(dest, &(struct stat){0}))
+                    e = [NSString stringWithFormat:@"%@\n\n其中一部分可能已在 %@ 中。", e, name];
+            } else {
+                e = @"此文件夹中没有可用名称";
+            }
+            if (scoped) [url stopAccessingSecurityScopedResource];
+            wq_log(@"import folder: %@ -> %@/%@: %@", url.path, dir, name, ok ? @"好" : e);
+            if (!ok) { *error = [NSString stringWithFormat:@"%@: %@", url.lastPathComponent, e ?: @"失败"]; return NO; }
+            if (![name isEqualToString:url.lastPathComponent]) [renamed addObject:name];
+        }
+        if (renamed.count)
+            *note = [NSString stringWithFormat:@"已存在同名文件夹，本次导入命名为 %@。",
+                     [renamed componentsJoinedByString:@", "]];
+        return YES;
+    }];
+}
+
+- (void)importSingleFile:(NSString *)source
+{
     // The picker hands over a local copy (asCopy). It is streamed into place,
     // never read into memory, and the existence check runs off the main thread.
-    NSString *source = urls.firstObject.path;
-    if (!source) return;
     NSString *dest = [_path stringByAppendingPathComponent:source.lastPathComponent];
     void (^cleanup)(void) = ^{ [NSFileManager.defaultManager removeItemAtPath:source error:nil]; };
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1666,6 +2260,8 @@ static NSString *const kSystemGroupRoot = @"/private/var/containers/Shared/Syste
 
 - (void)navigationController:(UINavigationController *)nav willShowViewController:(UIViewController *)vc animated:(BOOL)animated
 {
+    BOOL toolbar = [vc isKindOfClass:WQDirViewController.class] && [(WQDirViewController *)vc wq_wantsToolbar];
+    [nav setToolbarHidden:!toolbar animated:animated];
     NSUInteger depth = [nav.viewControllers indexOfObject:vc];
     if (depth == NSNotFound || depth < 2) {
         if (vc.navigationItem.leftBarButtonItem.tag == 0x484f4d45) vc.navigationItem.leftBarButtonItem = nil;
